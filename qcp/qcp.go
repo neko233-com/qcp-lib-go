@@ -76,7 +76,7 @@ func (p *Packet) Marshal() []byte {
 	return out
 }
 
-// MarshalInto writes packet into buf (zero alloc when buf is pre-pooled).
+// MarshalInto writes into pre-pooled buffer (hot path, zero alloc on sendBuf).
 func (p *Packet) MarshalInto(buf []byte) int {
 	payloadOffset := HEADER_SIZE + CRC_SIZE
 	size := payloadOffset + len(p.Payload)
@@ -84,7 +84,7 @@ func (p *Packet) MarshalInto(buf []byte) int {
 	binary.LittleEndian.PutUint16(buf[1:3], p.SeqID)
 	buf[3] = p.PathID
 	buf[4] = p.Priority
-	copy(buf[payloadOffset:], p.Payload)
+	copy(buf[payloadOffset:size], p.Payload)
 	checksum := crc32.ChecksumIEEE(buf[payloadOffset:size])
 	binary.LittleEndian.PutUint32(buf[HEADER_SIZE:HEADER_SIZE+CRC_SIZE], checksum)
 	return size
@@ -508,7 +508,6 @@ type Conn struct {
 	priority      byte
 	lastRealtime  uint16
 	connected     bool
-	sessionCache  map[string][]byte
 	mu            sync.RWMutex
 	sendBuf       []byte
 	recvBuf       []byte
@@ -529,7 +528,6 @@ func newConn(conn *net.UDPConn, remote *net.UDPAddr, sessionID uint32) *Conn {
 		stream:        STREAM_BATCH,
 		priority:      PRIORITY_NORMAL,
 		connected:     true,
-		sessionCache:  make(map[string][]byte),
 		sessionID:     sessionID,
 		sendBuf:       getBuf(),
 		recvBuf:       getBuf(),
@@ -737,19 +735,19 @@ func (c *Conn) senderLoop() {
 			time.Sleep(time.Microsecond)
 			continue
 		}
-		raw := c.sendBuf
-		n := pkt.MarshalInto(raw)
+		n := pkt.MarshalInto(c.sendBuf)
+		raw := c.sendBuf[:n]
 		if pkt.Stream == STREAM_REALTIME {
-			c.writePacket(raw[:n])
+			c.writePacket(raw)
 			releasePacket(pkt)
 			continue
 		}
-		if !c.arq.TrackSent(pkt.SeqID, raw[:n]) {
+		if !c.arq.TrackSent(pkt.SeqID, raw) {
 			c.sendQueue.Push(pkt)
 			time.Sleep(time.Millisecond)
 			continue
 		}
-		c.writePacket(raw[:n])
+		c.writePacket(raw)
 		releasePacket(pkt)
 	}
 }

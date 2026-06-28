@@ -17,7 +17,7 @@ var (
 )
 
 func getBuf() []byte {
-	return *bufPool.Get().(*[]byte)
+	return (*bufPool.Get().(*[]byte))[:maxPacketSize]
 }
 
 func putBuf(b []byte) {
