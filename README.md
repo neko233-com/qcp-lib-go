@@ -1,6 +1,12 @@
 # qcp-lib-go
 
-QCP Go 绑定 — 2026 游戏级 UDP 可靠传输协议
+**QCP Go 参考实现 — 新时代 UDP 可靠协议（游戏 / IoT · 超低延迟 · 高保证）**
+
+本仓库是 QCP 的**规范参考实现**。新特性在此开发与验证，通过 `qcp-benchmark` 压测（KCP 仅作基线对手）后移植至其他语言。
+
+```
+规范 (PROTOCOL.md) → qcp-lib-go (Go 验证) → qcp-benchmark (压测) → qcp-core / 其他绑定
+```
 
 ## 安装
 
@@ -11,78 +17,48 @@ go get github.com/neko233-com/qcp-lib-go
 ## 快速开始
 
 ```go
-package main
+conn, _ := qcp.Dial("server:9000")
 
-import (
-    "fmt"
-    "github.com/neko233-com/qcp-lib-go/qcp"
-)
+// 游戏移动 / IoT 遥测 — 最新覆盖
+conn.SendWithStream(pos, qcp.STREAM_REALTIME, 0)
 
-func main() {
-    // 创建连接
-    conn, err := qcp.Dial("game.example.com:9000")
-    if err != nil {
-        panic(err)
-    }
-    defer conn.Close()
+// 射击 / 设备指令 — deadline 内有界可靠
+conn.SendWithStream(cmd, qcp.STREAM_CRITICAL, 8*time.Millisecond)
 
-    // 设置优先级
-    conn.SetPriority(qcp.PRIORITY_CRITICAL)
-
-    // 发送数据
-    err = conn.Send([]byte("hello"))
-    if err != nil {
-        panic(err)
-    }
-
-    // 接收数据
-    buf := make([]byte, 1024)
-    n, err := conn.Recv(buf)
-    if err != nil {
-        panic(err)
-    }
-    fmt.Printf("Received: %s\n", buf[:n])
-}
+// 聊天 / OTA — 强可靠
+conn.SendWithStream(data, qcp.STREAM_BATCH, 0)
 ```
 
 ## 核心特性
 
-### 1. FEC-First 可靠性
-- 丢包无需重传，FEC 实时解码
-- 自适应冗余率 (5%-40%)
+### 1. TLB 语义交付
+- REALTIME: 不可靠，最新 tick 覆盖
+- CRITICAL: deadline 内 Fast NACK + 有界 ARQ
+- BATCH: 强可靠 ARQ + ACK
 
-### 2. Zero-Copy Ring Buffer
-- 预分配 64KB 环形缓冲区
-- 零 GC 压力
+### 2. Recovery Policy（按需）
+- 多路径 Race > Fast NACK > Network Coding > ARQ
 
-### 3. Lock-Free 队列
-- 无 mutex 竞争
-- 支持 100K+ 并发连接
+### 3. 基础设施
+- Zero-Copy Ring Buffer（64KB 预分配）
+- Lock-Free 队列（100K+ 并发）
+- Multi-Path Manager（WiFi + 5G）
+- AI 拥塞控制
 
-### 4. 三通道优先级
-```go
-// 关键数据 (射击/技能)
-conn.SetPriority(qcp.PRIORITY_CRITICAL)
+## 目录
 
-// 实时数据 (移动/AOI)
-conn.SetPriority(qcp.PRIORITY_NORMAL)
+| 文件 | 说明 |
+|------|------|
+| `qcp/qcp.go` | 连接、包格式、多路径、Ring Buffer |
+| `qcp/arq.go` | ARQ 引擎、Fast NACK |
+| `qcp/listener.go` | `Listen` / `Accept` 服务端 |
 
-// 批量数据 (聊天/日志)
-conn.SetPriority(qcp.PRIORITY_LOW)
+## 开发
+
+```bash
+go build ./...
+cd ../qcp-benchmark && go run . -mode all -duration 5s
 ```
-
-### 5. 协议头优化
-- QCP: 10 bytes
-- KCP: 24 bytes
-- 节省 58% 带宽
-
-## 性能
-
-| 指标 | KCP | QCP | 提升 |
-|------|-----|-----|------|
-| P50 延迟 | 97ms | 1.7ms | 98% |
-| P99 延迟 | 114ms | 2.6ms | 98% |
-| 并发连接 | 10K | 100K+ | 10x |
 
 ## License
 
