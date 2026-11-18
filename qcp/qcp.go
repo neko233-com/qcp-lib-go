@@ -17,11 +17,11 @@ import (
 // ══════════════════════════════════════════════════════════════
 
 const (
-	TYPE_DATA    byte = 0x01
-	TYPE_CODED   byte = 0x02
-	TYPE_ACK     byte = 0x03
-	TYPE_PING    byte = 0x04
-	TYPE_MIGRATE byte = 0x05
+	TYPE_DATA       byte = 0x01
+	TYPE_CODED      byte = 0x02
+	TYPE_ACK        byte = 0x03
+	TYPE_PING       byte = 0x04
+	TYPE_MIGRATE    byte = 0x05
 	TYPE_PATH_PROBE byte = 0x06
 	TYPE_NACK       byte = 0x07
 
@@ -186,14 +186,14 @@ type AICongestion struct {
 	bandwidth     float64
 	sendRate      float64
 	predictedLoss float64
-窗口大小       int
+	窗口大小          int
 }
 
 func NewAICongestion() *AICongestion {
 	return &AICongestion{
 		rttHistory:  make([]time.Duration, 0, 100),
 		lossHistory: make([]float64, 0, 100),
-		窗口大小:     100,
+		窗口大小:        100,
 		sendRate:    1000,
 	}
 }
@@ -227,7 +227,7 @@ func (ai *AICongestion) predict() {
 	trend := 0.0
 	if len(ai.rttHistory) >= 2 {
 		recent := ai.rttHistory[len(ai.rttHistory)-1]
-	older := ai.rttHistory[len(ai.rttHistory)-2]
+		older := ai.rttHistory[len(ai.rttHistory)-2]
 		if recent > older {
 			trend = 1.0
 		} else if recent < older {
@@ -491,12 +491,23 @@ func (q *LockFreeQueue) Pop() *Packet {
 // ══════════════════════════════════════════════════════════════
 
 type Conn struct {
-	conn          *net.UDPConn
-	remoteAddr    *net.UDPAddr
-	sendRing      *RingBuffer
-	recvRing      *RingBuffer
-	sendQueue     *LockFreeQueue
-	recvQueue     *LockFreeQueue
+	conn       *net.UDPConn
+	remoteMu   sync.RWMutex
+	remoteAddr *net.UDPAddr
+	pinPeer    bool
+	shared     bool
+	removePeer func()
+
+	received     chan []byte
+	writable     chan struct{}
+	sent         chan struct{}
+	done         chan struct{}
+	closeOnce    sync.Once
+	lastPacketNs atomic.Int64
+	sendMu       sync.Mutex
+	receiveMu    sync.Mutex
+	mu           sync.RWMutex
+
 	networkCoding *NetworkCoding
 	ai            *AICongestion
 	multipath     *MultiPathManager
@@ -507,126 +518,187 @@ type Conn struct {
 	deadline      time.Duration
 	priority      byte
 	lastRealtime  uint16
-	connected     bool
-	mu            sync.RWMutex
-	sendBuf       []byte
-	recvBuf       []byte
+	hasRealtime   bool
 }
 
-func newConn(conn *net.UDPConn, remote *net.UDPAddr, sessionID uint32) *Conn {
+func newConn(socket *net.UDPConn, remote *net.UDPAddr, pinned, shared bool) *Conn {
 	c := &Conn{
-		conn:          conn,
-		remoteAddr:    remote,
-		sendRing:      NewRingBuffer(RING_SIZE),
-		recvRing:      NewRingBuffer(RING_SIZE),
-		sendQueue:     NewLockFreeQueue(),
-		recvQueue:     NewLockFreeQueue(),
-		networkCoding: NewNetworkCoding(),
-		ai:            NewAICongestion(),
-		multipath:     NewMultiPathManager(),
-		arq:           NewARQEngine(),
-		stream:        STREAM_BATCH,
-		priority:      PRIORITY_NORMAL,
-		connected:     true,
-		sessionID:     sessionID,
-		sendBuf:       getBuf(),
-		recvBuf:       getBuf(),
+		conn: socket, remoteAddr: remote, pinPeer: pinned, shared: shared,
+		received:      make(chan []byte, 256),
+		writable:      make(chan struct{}, 1),
+		sent:          make(chan struct{}, 1),
+		done:          make(chan struct{}),
+		networkCoding: NewNetworkCoding(), ai: NewAICongestion(), multipath: NewMultiPathManager(),
+		arq: NewARQEngine(), stream: STREAM_BATCH, priority: PRIORITY_NORMAL,
+		sessionID: uint32(time.Now().UnixNano()),
 	}
-	go c.senderLoop()
-	go c.receiverLoop()
-	go c.retransmitLoop()
+	c.lastPacketNs.Store(time.Now().UnixNano())
 	return c
 }
 
+func (c *Conn) start() {
+	if !c.shared {
+		go c.receiverLoop()
+	}
+	go c.retransmitLoop()
+}
+
 func Dial(addr string) (*Conn, error) {
-	remoteAddr, err := net.ResolveUDPAddr("udp", addr)
+	return dial(addr, false)
+}
+
+// DialPinned restricts receive traffic to the configured UDP peer.
+func DialPinned(addr string) (*Conn, error) {
+	return dial(addr, true)
+}
+
+func dial(addr string, pinned bool) (*Conn, error) {
+	remote, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	var socket *net.UDPConn
+	if pinned {
+		socket, err = net.DialUDP("udp", nil, remote)
+	} else {
+		socket, err = net.ListenUDP("udp", nil)
+	}
 	if err != nil {
 		return nil, err
 	}
-	return newConn(conn, remoteAddr, uint32(time.Now().UnixNano())), nil
+	c := newConn(socket, remote, pinned, false)
+	c.start()
+	return c, nil
 }
 
 func (c *Conn) Send(data []byte) error {
-	if !c.connected {
-		return ErrNotConnected
-	}
-	return c.SendWithStream(data, c.stream, c.deadline)
+	c.mu.RLock()
+	stream, deadline := c.stream, c.deadline
+	c.mu.RUnlock()
+	return c.SendWithStream(data, stream, deadline)
 }
 
 func (c *Conn) SendWithStream(data []byte, stream byte, deadline time.Duration) error {
-	if !c.connected {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	select {
+	case <-c.done:
 		return ErrNotConnected
+	default:
 	}
+	c.mu.RLock()
+	priority := c.priority
+	c.mu.RUnlock()
+	mtu := c.arq.MTU()
 	if stream == STREAM_REALTIME {
-		pkt := acquirePacket()
-		*pkt = Packet{
-			Type:     TYPE_DATA,
-			Stream:   stream,
-			SeqID:    uint16(atomic.AddUint32(&c.seqID, 1)),
-			Priority: c.priority,
-			Payload:  data,
+		if len(data) > mtu-HEADER_SIZE-CRC_SIZE {
+			return ErrMessageTooLarge
 		}
-		c.sendQueue.Push(pkt)
-		return nil
+		return c.writePacketRaw(&Packet{
+			Type: TYPE_DATA, Stream: stream, SeqID: uint16(atomic.AddUint32(&c.seqID, 1)),
+			Priority: priority, Payload: data,
+		})
 	}
-	for _, frag := range fragment(data, c.arq.MTU()) {
-		seq := c.arq.NextSendSeq()
-		pkt := acquirePacket()
-		*pkt = Packet{
-			Type:     TYPE_DATA,
-			Stream:   stream,
-			SeqID:    seq,
-			Priority: c.priority,
-			Payload:  frag,
+	if len(data) > (mtu-HEADER_SIZE-CRC_SIZE)*4096 {
+		return ErrMessageTooLarge
+	}
+	parts := fragment(data, mtu)
+	packets, ok := c.arq.trackBatch(parts, func(seq uint16, part []byte) []byte {
+		pkt := Packet{Type: TYPE_DATA, Stream: stream, SeqID: seq, Priority: priority, Payload: part}
+		raw := make([]byte, HEADER_SIZE+CRC_SIZE+len(part))
+		return raw[:pkt.MarshalInto(raw)]
+	})
+	if !ok {
+		return ErrWouldBlock
+	}
+	signal(c.sent)
+	for _, raw := range packets {
+		if err := c.writePacket(raw); err != nil {
+			_ = c.Close()
+			return err
 		}
-		n := pkt.MarshalInto(c.sendBuf)
-		raw := c.sendBuf[:n]
-		if !c.arq.TrackSent(seq, raw) {
-			releasePacket(pkt)
-			return ErrWouldBlock
-		}
-		c.writePacket(raw)
-		releasePacket(pkt)
 	}
 	_ = deadline
 	return nil
 }
 
-func (c *Conn) Recv(buf []byte) (int, error) {
-	if !c.connected {
-		return 0, ErrNotConnected
+func signal(channel chan struct{}) {
+	select {
+	case channel <- struct{}{}:
+	default:
 	}
-	pkt := c.recvQueue.Pop()
-	if pkt == nil {
+}
+
+func (c *Conn) Recv(buf []byte) (int, error) {
+	select {
+	case <-c.done:
+		return 0, ErrNotConnected
+	default:
+	}
+	select {
+	case packet := <-c.received:
+		return copy(buf, packet), nil
+	default:
 		return 0, ErrWouldBlock
 	}
-	n := copy(buf, pkt.Payload)
-	releasePacket(pkt)
-	return n, nil
 }
 
-// RecvWait blocks until data arrives or timeout.
-func (c *Conn) RecvWait(buf []byte, timeout time.Duration) (int, error) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		n, err := c.Recv(buf)
-		if err == nil && n > 0 {
-			return n, nil
-		}
-		if err != nil && err != ErrWouldBlock {
-			return 0, err
-		}
-		time.Sleep(50 * time.Microsecond)
+// Receive delivers the next datagram or unblocks on cancellation.
+func (c *Conn) Receive(cancel <-chan struct{}) ([]byte, error) {
+	select {
+	case <-c.done:
+		return nil, ErrNotConnected
+	default:
 	}
-	return 0, ErrTimeout
+	select {
+	case packet := <-c.received:
+		return packet, nil
+	case <-c.done:
+		return nil, ErrNotConnected
+	case <-cancel:
+		return nil, ErrTimeout
+	}
 }
+
+// RecvWait waits for a delivered datagram without polling.
+func (c *Conn) RecvWait(buf []byte, timeout time.Duration) (int, error) {
+	if n, err := c.Recv(buf); err != ErrWouldBlock {
+		return n, err
+	}
+	if timeout <= 0 {
+		return 0, ErrTimeout
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	select {
+	case packet := <-c.received:
+		return copy(buf, packet), nil
+	case <-c.done:
+		return 0, ErrNotConnected
+	case <-deadline.C:
+		return 0, ErrTimeout
+	}
+}
+
+// Writable signals that an ACK has opened the reliable send window.
+func (c *Conn) Writable() <-chan struct{} { return c.writable }
+
+// Done is closed when the connection can no longer deliver data.
+func (c *Conn) Done() <-chan struct{} { return c.done }
+
+func (c *Conn) RemoteAddr() net.Addr {
+	c.remoteMu.RLock()
+	defer c.remoteMu.RUnlock()
+	return c.remoteAddr
+}
+
+func (c *Conn) LocalAddr() net.Addr { return c.conn.LocalAddr() }
+
+// MaxDatagramPayload is the unfragmented application payload supported by the path.
+func (c *Conn) MaxDatagramPayload() int { return c.arq.MTU() - HEADER_SIZE - CRC_SIZE }
 
 func (c *Conn) ConfigureARQ(cfg ARQConfig) {
-	c.stream = STREAM_BATCH
+	c.SetStream(STREAM_BATCH)
 	c.arq.Configure(cfg)
 }
 
@@ -634,184 +706,173 @@ func (c *Conn) SetWindow(snd, rcv int) {
 	c.arq.Configure(ARQConfig{SendWnd: snd, RecvWnd: rcv})
 }
 
-func (c *Conn) SetMTU(mtu int) {
-	c.arq.Configure(ARQConfig{MTU: mtu})
+func (c *Conn) SetMTU(mtu int) { c.arq.Configure(ARQConfig{MTU: mtu}) }
+
+func (c *Conn) SetStream(stream byte) {
+	c.mu.Lock()
+	c.stream = stream
+	c.mu.Unlock()
 }
 
-func (c *Conn) SetStream(stream byte) { c.stream = stream }
+func (c *Conn) SetDeadline(d time.Duration) {
+	c.mu.Lock()
+	c.deadline = d
+	c.mu.Unlock()
+}
 
-func (c *Conn) SetDeadline(d time.Duration) { c.deadline = d }
-
-func (c *Conn) SetPriority(priority byte) { c.priority = priority }
+func (c *Conn) SetPriority(priority byte) {
+	c.mu.Lock()
+	c.priority = priority
+	c.mu.Unlock()
+}
 
 func (c *Conn) SessionID() uint32 { return c.sessionID }
 
-func (c *Conn) AddPath(name, addr string) error {
-	return c.multipath.AddPath(name, addr)
-}
+func (c *Conn) AddPath(name, addr string) error { return c.multipath.AddPath(name, addr) }
 
 func (c *Conn) SetPathStrategy(strategy string) {
+	c.multipath.mu.Lock()
 	c.multipath.strategy = strategy
+	c.multipath.mu.Unlock()
 }
 
 func (c *Conn) GetAIStats() (rate float64, predictedLoss float64) {
 	return c.ai.GetSendRate(), c.ai.GetPredictedLoss()
 }
 
-func (c *Conn) GetCodingStats() float64 {
-	return c.networkCoding.codingRate
-}
+func (c *Conn) GetCodingStats() float64 { return c.networkCoding.codingRate }
 
 func (c *Conn) Close() error {
-	c.connected = false
-	putBuf(c.sendBuf)
-	putBuf(c.recvBuf)
-	return c.conn.Close()
+	var err error
+	c.closeOnce.Do(func() {
+		close(c.done)
+		if c.shared {
+			if c.removePeer != nil {
+				c.removePeer()
+			}
+		} else {
+			err = c.conn.Close()
+		}
+	})
+	return err
 }
 
-func (c *Conn) writePacketRaw(pkt *Packet) {
-	n := pkt.MarshalInto(c.sendBuf)
-	c.writePacket(c.sendBuf[:n])
+func (c *Conn) writePacketRaw(pkt *Packet) error {
+	buf := getBuf()
+	defer putBuf(buf)
+	return c.writePacket(buf[:pkt.MarshalInto(buf)])
 }
 
-func (c *Conn) writePacket(raw []byte) {
+func (c *Conn) writePacket(raw []byte) error {
 	if c.multipath.pathCount() > 0 {
-		_ = c.multipath.Send(raw)
-		return
+		return c.multipath.Send(raw)
 	}
 	if c.conn.RemoteAddr() != nil {
-		_, _ = c.conn.Write(raw)
-		return
+		_, err := c.conn.Write(raw)
+		return err
 	}
-	_, _ = c.conn.WriteToUDP(raw, c.remoteAddr)
-}
-
-func (c *Conn) readPacket(buf []byte) (int, *net.UDPAddr, error) {
-	if c.conn.RemoteAddr() != nil {
-		n, err := c.conn.Read(buf)
-		return n, c.remoteAddr, err
-	}
-	return c.conn.ReadFromUDP(buf)
-}
-
-func (c *Conn) sendACK(seq uint16) {
-	ack := acquirePacket()
-	*ack = Packet{Type: TYPE_ACK, SeqID: seq}
-	c.writePacketRaw(ack)
-	releasePacket(ack)
-}
-
-func (c *Conn) sendNACK(seq uint16) {
-	nack := acquirePacket()
-	*nack = Packet{Type: TYPE_NACK, SeqID: seq}
-	c.writePacketRaw(nack)
-	releasePacket(nack)
-}
-
-func (c *Conn) enqueuePayload(stream byte, payload []byte) {
-	pkt := acquirePacket()
-	cp := getBuf()[:len(payload)]
-	copy(cp, payload)
-	pkt.Stream = stream
-	pkt.Payload = cp
-	c.recvQueue.Push(pkt)
-}
-
-func (c *Conn) handleReliable(pkt *Packet) {
-	ordered, nacks := c.arq.OnRecv(pkt.SeqID, pkt.Payload)
-	c.sendACK(pkt.SeqID)
-	for _, seq := range nacks {
-		c.sendNACK(seq)
-	}
-	for _, payload := range ordered {
-		c.enqueuePayload(pkt.Stream, payload)
-	}
-}
-
-func (c *Conn) senderLoop() {
-	for c.connected {
-		pkt := c.sendQueue.Pop()
-		if pkt == nil {
-			time.Sleep(time.Microsecond)
-			continue
-		}
-		n := pkt.MarshalInto(c.sendBuf)
-		raw := c.sendBuf[:n]
-		if pkt.Stream == STREAM_REALTIME {
-			c.writePacket(raw)
-			releasePacket(pkt)
-			continue
-		}
-		if !c.arq.TrackSent(pkt.SeqID, raw) {
-			c.sendQueue.Push(pkt)
-			time.Sleep(time.Millisecond)
-			continue
-		}
-		c.writePacket(raw)
-		releasePacket(pkt)
-	}
+	c.remoteMu.RLock()
+	remote := c.remoteAddr
+	c.remoteMu.RUnlock()
+	_, err := c.conn.WriteToUDP(raw, remote)
+	return err
 }
 
 func (c *Conn) retransmitLoop() {
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for c.connected {
-		<-ticker.C
-		for _, raw := range c.arq.Retransmits() {
-			c.writePacket(raw)
+	for {
+		if c.arq.PendingCount() == 0 {
+			select {
+			case <-c.done:
+				return
+			case <-c.sent:
+			}
+		}
+		timer := time.NewTimer(c.arq.nextRetransmitDelay())
+		select {
+		case <-c.done:
+			timer.Stop()
+			return
+		case <-c.sent:
+			timer.Stop()
+		case <-timer.C:
+			if c.arq.retryBudgetExhausted() {
+				_ = c.Close()
+				return
+			}
+			for _, raw := range c.arq.Retransmits() {
+				if err := c.writePacket(raw); err != nil {
+					_ = c.Close()
+					return
+				}
+			}
 		}
 	}
 }
 
 func (c *Conn) deliver(pkt *Packet) {
+	c.receiveMu.Lock()
+	defer c.receiveMu.Unlock()
+	c.lastPacketNs.Store(time.Now().UnixNano())
 	switch pkt.Type {
 	case TYPE_ACK:
 		c.arq.OnACK(pkt.SeqID)
+		signal(c.writable)
 	case TYPE_NACK:
 		if raw := c.arq.RetransmitSeq(pkt.SeqID); raw != nil {
-			c.writePacket(raw)
+			_ = c.writePacket(raw)
 		}
 	case TYPE_DATA, TYPE_CODED:
 		if pkt.Stream == STREAM_REALTIME {
-			if pkt.SeqID >= c.lastRealtime {
-				c.lastRealtime = pkt.SeqID
-				c.enqueuePayload(pkt.Stream, pkt.Payload)
+			if !c.hasRealtime || int16(pkt.SeqID-c.lastRealtime) > 0 {
+				c.lastRealtime, c.hasRealtime = pkt.SeqID, true
+				select {
+				case c.received <- append([]byte(nil), pkt.Payload...):
+				default:
+				}
 			}
-		} else {
-			c.handleReliable(pkt)
+			return
+		}
+		ordered, nacks, accepted := c.arq.onRecv(pkt.SeqID, pkt.Payload)
+		for _, payload := range ordered {
+			select {
+			case c.received <- payload:
+			default:
+				_ = c.Close()
+				return
+			}
+		}
+		if accepted {
+			_ = c.writePacketRaw(&Packet{Type: TYPE_ACK, SeqID: pkt.SeqID})
+		}
+		for _, seq := range nacks {
+			_ = c.writePacketRaw(&Packet{Type: TYPE_NACK, SeqID: seq})
 		}
 	}
 }
 
 func (c *Conn) receiverLoop() {
-	buf := c.recvBuf
-	for c.connected {
-		n, remote, err := c.readPacket(buf)
+	buf := getBuf()
+	defer putBuf(buf)
+	for {
+		n, remote, err := c.conn.ReadFromUDP(buf)
 		if err != nil {
-			continue
-		}
-		if c.conn.RemoteAddr() == nil {
-			if remote.IP.String() != c.remoteAddr.IP.String() {
-				continue
-			}
-			if remote.Port != c.remoteAddr.Port {
-				c.remoteAddr = remote
-			}
+			_ = c.Close()
+			return
 		}
 		pkt, err := Unmarshal(buf[:n])
 		if err != nil {
 			continue
 		}
-		switch pkt.Type {
-		case TYPE_ACK:
-			c.arq.OnACK(pkt.SeqID)
-		case TYPE_NACK:
-			if raw := c.arq.RetransmitSeq(pkt.SeqID); raw != nil {
-				c.writePacket(raw)
+		if c.conn.RemoteAddr() == nil {
+			c.remoteMu.Lock()
+			if !remote.IP.Equal(c.remoteAddr.IP) || (c.pinPeer && remote.Port != c.remoteAddr.Port) {
+				c.remoteMu.Unlock()
+				continue
 			}
-		case TYPE_DATA, TYPE_CODED:
-			c.deliver(pkt)
+			c.remoteAddr = remote
+			c.remoteMu.Unlock()
 		}
+		c.deliver(pkt)
 	}
 }
 
@@ -839,9 +900,10 @@ func fragment(data []byte, mtu int) [][]byte {
 // ══════════════════════════════════════════════════════════════
 
 var (
-	ErrNotConnected      = errors.New("qcp: not connected")
-	ErrWouldBlock        = errors.New("qcp: would block")
-	ErrInvalidPacket     = errors.New("qcp: invalid packet")
-	ErrChecksumMismatch  = errors.New("qcp: checksum mismatch")
+	ErrNotConnected        = errors.New("qcp: not connected")
+	ErrWouldBlock          = errors.New("qcp: would block")
+	ErrInvalidPacket       = errors.New("qcp: invalid packet")
+	ErrChecksumMismatch    = errors.New("qcp: checksum mismatch")
+	ErrMessageTooLarge     = errors.New("qcp: message too large")
 	ErrInsufficientPackets = errors.New("qcp: insufficient packets for decode")
 )
