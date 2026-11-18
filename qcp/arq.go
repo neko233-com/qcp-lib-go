@@ -6,9 +6,12 @@ import (
 )
 
 const (
-	defaultRTO       = 200 * time.Millisecond
-	defaultMinRTO    = 10 * time.Millisecond
-	maxPacketRetries = 12
+	defaultRTO            = 200 * time.Millisecond
+	defaultMinRTO         = 10 * time.Millisecond
+	maxPacketRetries      = 12
+	streamInitialWindow   = 10
+	streamMinWindow       = 2
+	streamIdleRestartTime = time.Second
 )
 
 type pendingPkt struct {
@@ -39,6 +42,14 @@ type ARQEngine struct {
 	noCongestion bool
 	mtu          int
 	onNACK       func(seq uint16)
+
+	// A zero congestion window preserves the raw packet API's configured window.
+	congestionWindow    int
+	congestionThreshold int
+	congestionACKs      int
+	recoveryUntil       time.Time
+	lastDataSentAt      time.Time
+	recovery            RecoveryStats
 }
 
 func NewARQEngine() *ARQEngine {
@@ -53,6 +64,73 @@ func NewARQEngine() *ARQEngine {
 		mtu:        1400,
 		// Both sequence counters start at zero.
 	}
+}
+
+func (a *ARQEngine) configureStream() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.mtu = StreamMTU
+	a.congestionWindow = min(streamInitialWindow, int(a.sndWnd))
+	a.congestionThreshold = int(a.sndWnd)
+}
+
+// RecoveryStats describes outbound reliable data. Retransmission can be
+// caused by loss, delayed delivery, reordering or a lost acknowledgment.
+type RecoveryStats struct {
+	DataDatagrams    uint64
+	FastRetransmits  uint64
+	TimerRetransmits uint64
+}
+
+func (a *ARQEngine) recoveryStats() RecoveryStats {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.recovery
+}
+
+func (a *ARQEngine) streamSendLimit(now time.Time) int {
+	if a.congestionWindow == 0 {
+		return int(a.sndWnd)
+	}
+	if len(a.pending) == 0 && now.Sub(a.lastDataSentAt) >= max(a.rto, streamIdleRestartTime) {
+		a.congestionWindow = min(a.congestionWindow, streamInitialWindow)
+		a.congestionACKs = 0
+	}
+	return min(int(a.sndWnd), a.congestionWindow)
+}
+
+func (a *ARQEngine) acknowledgeCongestionWindow(now time.Time) {
+	window := a.congestionWindow
+	if window == 0 || now.Before(a.recoveryUntil) || window >= int(a.sndWnd) || len(a.pending)*2 < window {
+		return
+	}
+	if window < a.congestionThreshold {
+		a.congestionWindow++
+		return
+	}
+	a.congestionACKs++
+	if a.congestionACKs >= window {
+		a.congestionWindow++
+		a.congestionACKs = 0
+	}
+}
+
+func (a *ARQEngine) reduceCongestionWindow(now time.Time, timeout bool) {
+	window := a.congestionWindow
+	if window == 0 || now.Before(a.recoveryUntil) {
+		return
+	}
+	a.congestionThreshold = max(streamMinWindow, window/2)
+	a.congestionWindow = a.congestionThreshold
+	if timeout {
+		a.congestionWindow = streamMinWindow
+	}
+	a.congestionACKs = 0
+	rtt := a.srtt
+	if rtt == 0 {
+		rtt = a.rto
+	}
+	a.recoveryUntil = now.Add(max(rtt, a.minRTO))
 }
 
 func (a *ARQEngine) Configure(cfg ARQConfig) {
@@ -111,6 +189,7 @@ func (a *ARQEngine) TrackSent(seq uint16, raw []byte) bool {
 		return false
 	}
 	a.pending[seq] = &pendingPkt{raw: append([]byte(nil), raw...), sentAt: time.Now()}
+	a.recovery.DataDatagrams++
 	return true
 }
 
@@ -118,13 +197,15 @@ func (a *ARQEngine) TrackSent(seq uint16, raw []byte) bool {
 func (a *ARQEngine) trackBatch(parts [][]byte, makePacket func(uint16, []byte) []byte) ([][]byte, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if len(parts)+len(a.pending) > int(a.sndWnd) {
+	now := time.Now()
+	if len(parts)+len(a.pending) > a.streamSendLimit(now) {
 		return nil, false
 	}
 	if int(uint16(a.sendNext-a.windowBase))+len(parts) > int(a.sndWnd) {
 		return nil, false
 	}
-	now := time.Now()
+	a.lastDataSentAt = now
+	a.recovery.DataDatagrams += uint64(len(parts))
 	packets := make([][]byte, 0, len(parts))
 	for _, part := range parts {
 		seq := a.sendNext
@@ -140,7 +221,8 @@ func (a *ARQEngine) OnACK(seq uint16) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if p := a.pending[seq]; p != nil && p.retries == 0 {
-		sample := time.Since(p.sentAt)
+		now := time.Now()
+		sample := now.Sub(p.sentAt)
 		if a.srtt == 0 {
 			a.srtt, a.rttVar = sample, sample/2
 		} else {
@@ -149,6 +231,7 @@ func (a *ARQEngine) OnACK(seq uint16) {
 			a.srtt = (7*a.srtt + sample) / 8
 		}
 		a.rto = max(a.srtt+4*a.rttVar, a.minRTO)
+		a.acknowledgeCongestionWindow(now)
 	}
 	delete(a.pending, seq)
 	if seq == a.windowBase {
@@ -212,6 +295,10 @@ func (a *ARQEngine) Retransmits() [][]byte {
 			out = append(out, p.raw)
 		}
 	}
+	if len(out) > 0 {
+		a.recovery.TimerRetransmits += uint64(len(out))
+		a.reduceCongestionWindow(now, true)
+	}
 	return out
 }
 
@@ -223,10 +310,7 @@ func (a *ARQEngine) effectiveRTO(retries int) time.Duration {
 			return 2 * time.Second
 		}
 	}
-	if rto < a.minRTO {
-		return a.minRTO
-	}
-	return rto
+	return max(a.minRTO, min(rto, 2*time.Second))
 }
 
 func (a *ARQEngine) RetransmitSeq(seq uint16) []byte {
@@ -234,8 +318,11 @@ func (a *ARQEngine) RetransmitSeq(seq uint16) []byte {
 	defer a.mu.Unlock()
 	if p := a.pending[seq]; p != nil && p.retries < maxPacketRetries &&
 		(p.retries == 0 || time.Since(p.sentAt) >= a.minRTO) {
-		p.sentAt = time.Now()
+		now := time.Now()
+		p.sentAt = now
 		p.retries++
+		a.recovery.FastRetransmits++
+		a.reduceCongestionWindow(now, false)
 		return p.raw
 	}
 	return nil

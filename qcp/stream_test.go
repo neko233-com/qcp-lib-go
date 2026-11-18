@@ -124,3 +124,41 @@ func TestStreamRetransmitsDroppedPacketAndPreservesOrder(t *testing.T) {
 		t.Fatalf("expired read error = %v", err)
 	}
 }
+
+func TestStreamCongestionRecoversFromLossAndResetsOnIdle(t *testing.T) {
+	a := NewARQEngine()
+	a.configureStream()
+	payloads := make([][]byte, streamInitialWindow)
+	marshal := func(_ uint16, _ []byte) []byte { return []byte{1} }
+	if _, ok := a.trackBatch(payloads, marshal); !ok {
+		t.Fatal("initial stream window did not accept a full flight")
+	}
+	if _, ok := a.trackBatch(payloads[:1], marshal); ok {
+		t.Fatal("stream exceeded its initial flight window")
+	}
+	if a.RetransmitSeq(0) == nil || a.congestionWindow != streamInitialWindow/2 {
+		t.Fatalf("fast recovery did not reduce the flight window: %d", a.congestionWindow)
+	}
+	if a.RetransmitSeq(1) == nil || a.congestionWindow != streamInitialWindow/2 {
+		t.Fatalf("same-round losses reduced the window again: %d", a.congestionWindow)
+	}
+	a.recoveryUntil = time.Time{}
+	a.pending[2].sentAt = time.Now().Add(-3 * time.Second)
+	a.Retransmits()
+	if a.congestionWindow != streamMinWindow {
+		t.Fatalf("timeout did not return to a conservative window: %d", a.congestionWindow)
+	}
+	stats := a.recoveryStats()
+	if stats.DataDatagrams != streamInitialWindow || stats.FastRetransmits != 2 || stats.TimerRetransmits != 1 {
+		t.Fatalf("unexpected recovery counters: %+v", stats)
+	}
+	for seq := uint16(0); seq < streamInitialWindow; seq++ {
+		a.OnACK(seq)
+	}
+	a.recoveryUntil = time.Time{}
+	a.congestionWindow = 50
+	a.lastDataSentAt = time.Now().Add(-3 * time.Second)
+	if _, ok := a.trackBatch(payloads, marshal); !ok || a.congestionWindow != streamInitialWindow {
+		t.Fatalf("idle sender did not restart with a bounded flight: %d", a.congestionWindow)
+	}
+}

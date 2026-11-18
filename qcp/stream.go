@@ -21,7 +21,7 @@ func DialStreamContext(ctx context.Context, addr string) (net.Conn, error) {
 	}
 	udp := socket.(*net.UDPConn)
 	peer := newConn(udp, udp.RemoteAddr().(*net.UDPAddr), true, false)
-	peer.SetMTU(StreamMTU)
+	peer.arq.configureStream()
 	peer.start()
 	return &streamConn{Conn: peer}, nil
 }
@@ -42,8 +42,17 @@ func (l streamListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	peer.SetMTU(StreamMTU)
+	peer.arq.configureStream()
 	return &streamConn{Conn: peer}, nil
+}
+
+// ReadRecoveryStats returns counters for the QCP sender underlying conn.
+func ReadRecoveryStats(conn net.Conn) (RecoveryStats, bool) {
+	stream, ok := conn.(*streamConn)
+	if !ok {
+		return RecoveryStats{}, false
+	}
+	return stream.arq.recoveryStats(), true
 }
 
 type streamConn struct {
