@@ -20,6 +20,9 @@ func TestSelectiveACKKeepsEarlierPacketAcrossWrap(t *testing.T) {
 		t.Fatal("initial send window should accept two packets")
 	}
 	sender.OnACK(0)
+	if raw := sender.RetransmitSeq(65535); len(raw) != 1 || raw[0] != 1 {
+		t.Fatal("first fast NACK must recover an early gap without waiting for RTO")
+	}
 	if sender.PendingCount() != 1 || sender.pending[65535] == nil {
 		t.Fatal("selective ACK removed an undelivered earlier packet")
 	}

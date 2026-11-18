@@ -779,22 +779,35 @@ func (c *Conn) writePacket(raw []byte) error {
 }
 
 func (c *Conn) retransmitLoop() {
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
 	for {
-		if c.arq.PendingCount() == 0 {
+		delay, pending := c.arq.nextRetransmitDelay()
+		switch {
+		case !pending:
 			select {
 			case <-c.done:
 				return
 			case <-c.sent:
 			}
-		}
-		timer := time.NewTimer(c.arq.nextRetransmitDelay())
-		select {
-		case <-c.done:
-			timer.Stop()
-			return
-		case <-c.sent:
-			timer.Stop()
-		case <-timer.C:
+		case delay > 0:
+			timer.Reset(delay)
+			select {
+			case <-c.done:
+				timer.Stop()
+				return
+			case <-c.sent:
+				if !timer.Stop() {
+					<-timer.C
+				}
+			case <-timer.C:
+			}
+		default:
+			select {
+			case <-c.done:
+				return
+			default:
+			}
 			if c.arq.retryBudgetExhausted() {
 				_ = c.Close()
 				return
@@ -817,6 +830,7 @@ func (c *Conn) deliver(pkt *Packet) {
 	case TYPE_ACK:
 		c.arq.OnACK(pkt.SeqID)
 		signal(c.writable)
+		signal(c.sent)
 	case TYPE_NACK:
 		if raw := c.arq.RetransmitSeq(pkt.SeqID); raw != nil {
 			_ = c.writePacket(raw)

@@ -232,7 +232,8 @@ func (a *ARQEngine) effectiveRTO(retries int) time.Duration {
 func (a *ARQEngine) RetransmitSeq(seq uint16) []byte {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if p := a.pending[seq]; p != nil && p.retries < maxPacketRetries && time.Since(p.sentAt) >= a.minRTO {
+	if p := a.pending[seq]; p != nil && p.retries < maxPacketRetries &&
+		(p.retries == 0 || time.Since(p.sentAt) >= a.minRTO) {
 		p.sentAt = time.Now()
 		p.retries++
 		return p.raw
@@ -257,7 +258,7 @@ func (a *ARQEngine) retryBudgetExhausted() bool {
 	return false
 }
 
-func (a *ARQEngine) nextRetransmitDelay() time.Duration {
+func (a *ARQEngine) nextRetransmitDelay() (time.Duration, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now()
@@ -265,5 +266,5 @@ func (a *ARQEngine) nextRetransmitDelay() time.Duration {
 	for _, packet := range a.pending {
 		delay = min(delay, a.effectiveRTO(packet.retries)-now.Sub(packet.sentAt))
 	}
-	return max(delay, time.Millisecond)
+	return delay, len(a.pending) != 0
 }
